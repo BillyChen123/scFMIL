@@ -1,0 +1,9 @@
+anndata
+numpy
+pandas
+scanpy
+scikit-learn
+scipy
+torch
+tqdm
+mindspore
