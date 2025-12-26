@@ -13,22 +13,32 @@ This workspace contains a two-stage pipeline:
 
 ## Quick start
 
-# 0) Install dependencies
+0) Install dependencies
+```bash
 pip install -r requirements.txt
+```
 
-# 1) Optional: CellFM fine-tuning
+1) Optional: CellFM fine-tuning
+```bash
 python -m cellfm.finetune --adata data/train.h5ad --ms-ckpt path/to.ckpt --out-dir outputs/cellfm
+```
 
-# 2) Export per-cell embeddings
+2) Export per-cell embeddings
+```bash
 python -m cellfm.embed --adata data/train.h5ad --pt-ckpt outputs/cellfm/model.pt \
   --out-adata data/with_emb.h5ad --emb-key X_cellfm
+```
 
-# 3) Pooling training (predicts z-score labels)
+3) Pooling training (predicts z-score labels)
+```bash
 python -m pooling.train --adata data/with_emb.h5ad --emb_key X_cellfm --out_dir outputs/pooling
+```
 
-# 4) Weight extraction from a trained checkpoint
+4) Weight extraction from a trained checkpoint
+```bash
 python -m pooling.extract --adata data/with_emb.h5ad --emb_key X_cellfm \
   --ckpt_path outputs/pooling/model.pt --out_dir outputs/pooling
+```
 
 ## Data expectations
 
