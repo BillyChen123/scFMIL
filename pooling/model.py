@@ -1,129 +1,249 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal
+
 import torch
 from torch import nn
 
 
-class AttentionPooling(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 64, gated: bool = False):
-        super().__init__()
-        self.fc = nn.Linear(input_dim, hidden_dim)
-        self.gated = gated
-        if gated:
-            self.gate = nn.Linear(input_dim, hidden_dim)
-        self.context = nn.Linear(hidden_dim, 1, bias=True)
+class AttentionPoolingLegacy(nn.Module):
+    """Legacy attention: a single linear layer over input features."""
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, return_scores: bool = False):
-        # x: [batch, n_items, input_dim], mask: [batch, n_items]
-        h = torch.tanh(self.fc(x))
-        if self.gated:
-            h = h * torch.sigmoid(self.gate(x))
-        scores = self.context(h).squeeze(-1)
-        scores = scores.masked_fill(~mask, float("-inf"))
-        weights = torch.softmax(scores, dim=1)
-        weights = torch.nan_to_num(weights, nan=0.0)
-        pooled = torch.sum(weights.unsqueeze(-1) * x, dim=1)
-        # pooled: [batch, input_dim], weights: [batch, n_items]
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.attention = nn.Sequential(nn.Linear(input_dim, 1, bias=False))
+
+    def forward(self, x: torch.Tensor, idx: torch.Tensor, return_scores: bool = False):
+        # x: [B, N, D], idx: [B, N] with -1 as padding
+        mask = idx != -1
+        attn_scores = self.attention(x).squeeze(-1)  # [B, N]
+        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        pooled = torch.sum(attn_weights.unsqueeze(-1) * x, dim=1)
         if return_scores:
-            return pooled, weights, scores
-        return pooled, weights
+            return pooled, attn_weights, attn_scores
+        return pooled, attn_weights
+
+
+class AttentionPooling(nn.Module):
+    """Current attention: tanh(hidden) + context vector."""
+
+    def __init__(self, input_dim: int, hidden_dim_attn: int = 64):
+        super().__init__()
+        self.attention_fc = nn.Linear(input_dim, hidden_dim_attn)
+        self.context_vector_fc = nn.Linear(hidden_dim_attn, 1)
+
+    def forward(self, x: torch.Tensor, idx: torch.Tensor, return_scores: bool = False):
+        # x: [B, N, D], idx: [B, N] with -1 as padding
+        mask = idx != -1
+        h = torch.tanh(self.attention_fc(x))
+        attn_scores = self.context_vector_fc(h).squeeze(-1)  # [B, N]
+        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        pooled = torch.sum(attn_weights.unsqueeze(-1) * x, dim=1)
+        if return_scores:
+            return pooled, attn_weights, attn_scores
+        return pooled, attn_weights
 
 
 class MeanPooling(nn.Module):
-    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, idx: torch.Tensor):
+        mask = idx != -1
         mask = mask.unsqueeze(-1)
-        mask_f = mask.float()
-        x = x * mask_f
-        denom = mask_f.sum(dim=1).clamp(min=1.0)
-        pooled = x.sum(dim=1) / denom
-        weights = mask_f.squeeze(-1) / denom
+        x_masked = x * mask
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        pooled = x_masked.sum(dim=1) / denom
+        weights = mask.squeeze(-1).float() / denom.squeeze(-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
         return pooled, weights
 
 
-class ClusterAggregator(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        pool_mode: str = "attn",
-        use_gated_attn: bool = False,
-        mean_attn_alpha: float = 1.0,
-    ):
+class AggCluster(nn.Module):
+    def __init__(self, input_dim: int, attn_hidden: int, legacy_attn: bool = False):
         super().__init__()
-        if pool_mode not in {"attn", "mean", "mean_attn"}:
-            raise ValueError(f"Unknown pool_mode: {pool_mode}")
-        self.pool_mode = pool_mode
-        if pool_mode in {"attn", "mean_attn"}:
-            self.pool = AttentionPooling(input_dim, hidden_dim, gated=use_gated_attn)
-        if pool_mode in {"mean", "mean_attn"}:
-            self.mean_pool = MeanPooling()
-        self.mean_attn_alpha = mean_attn_alpha
+        self.fc_att2 = (
+            AttentionPoolingLegacy(input_dim)
+            if legacy_attn
+            else AttentionPooling(input_dim, attn_hidden)
+        )
 
-    def forward(self, expr, cell_ids, mask, cluster):
-        # expr: [max_cells, input_dim], cell_ids/mask/cluster: [max_cells]
-        valid = mask
-        expr = expr[valid]
-        cell_ids = cell_ids[valid]
-        cluster = cluster[valid]
-        # expr: [n_cells, input_dim]
+    def agg_cluster(self, expr_i, idx_i, mask_i, cluster_i):
+        # expr_i: [max_cell, D], idx_i/mask_i/cluster_i: [max_cell]
+        unmask = mask_i == 1
+        expr_i = expr_i[unmask]
+        idx_i = idx_i[unmask]
+        cluster_i = cluster_i[unmask]
 
-        unique = torch.unique(cluster[cluster >= 0])
-        n_clusters = unique.numel()
-        if n_clusters == 0:
-            empty = expr.new_zeros((1, expr.shape[1]))
-            return empty, expr.new_zeros((1, 1)), cell_ids.new_full((1, 1), -1)
+        unique_clusters = cluster_i[cluster_i >= 0].unique()
+        n_clusters = unique_clusters.numel()
+        unique_clusters = torch.arange(n_clusters, device=expr_i.device)
 
+        feat_dim = expr_i.shape[1]
         max_cells = 0
-        for cid in unique:
-            max_cells = max(max_cells, int((cluster == cid).sum().item()))
+        for cluster_id in unique_clusters:
+            max_cells = max(max_cells, int((cluster_i == cluster_id).sum().item()))
 
-        feat_dim = expr.shape[1]
-        cluster_expr = expr.new_zeros((n_clusters, max_cells, feat_dim))
-        cluster_ids = cell_ids.new_full((n_clusters, max_cells), -1)
-        cluster_mask = torch.zeros((n_clusters, max_cells), dtype=torch.bool, device=expr.device)
+        agg_expr = torch.full(
+            (n_clusters, max_cells, feat_dim),
+            fill_value=0.0,
+            device=expr_i.device,
+            dtype=expr_i.dtype,
+        )
+        agg_idx = torch.full(
+            (n_clusters, max_cells),
+            fill_value=-1,
+            device=idx_i.device,
+            dtype=idx_i.dtype,
+        )
+        agg_cluster = torch.full(
+            (n_clusters, max_cells),
+            fill_value=-1,
+            device=idx_i.device,
+            dtype=idx_i.dtype,
+        )
 
-        for i, cid in enumerate(unique):
-            c_mask = cluster == cid
-            c_expr = expr[c_mask]
-            c_ids = cell_ids[c_mask]
-            n = c_expr.shape[0]
-            cluster_expr[i, :n] = c_expr
-            cluster_ids[i, :n] = c_ids
-            cluster_mask[i, :n] = True
+        for i, cluster_id in enumerate(unique_clusters):
+            cluster_mask = cluster_i == cluster_id
+            expr_in_cluster = expr_i[cluster_mask]
+            idx_in_cluster = idx_i[cluster_mask]
+            n = expr_in_cluster.shape[0]
+            agg_expr[i, :n] = expr_in_cluster
+            agg_idx[i, :n] = idx_in_cluster
+            agg_cluster[i, :n] = cluster_id
 
-        if self.pool_mode == "mean":
-            cluster_emb, cell_weights = self.mean_pool(cluster_expr, cluster_mask)
-        else:
-            attn_emb, cell_weights = self.pool(cluster_expr, cluster_mask)
-            if self.pool_mode == "mean_attn":
-                mean_emb, _ = self.mean_pool(cluster_expr, cluster_mask)
-                cluster_emb = mean_emb + self.mean_attn_alpha * attn_emb
-            else:
-                cluster_emb = attn_emb
-        # cluster_emb: [n_clusters, input_dim], cell_weights: [n_clusters, max_cells]
-        return cluster_emb, cell_weights, cluster_ids
+        return agg_expr, agg_idx, agg_cluster
+
+    def forward(self, expr, idx, mask, cluster):
+        # expr: [B, max_cell, D]
+        agg_res, agg_weight, agg_idx, agg_cluster = [], [], [], []
+        for i in range(expr.shape[0]):
+            agg_expr_i, agg_idx_i, agg_cluster_i = self.agg_cluster(
+                expr[i], idx[i], mask[i], cluster[i]
+            )
+            agg_expr_i, agg_weight_i = self.fc_att2(agg_expr_i, agg_idx_i)
+            agg_res.append(agg_expr_i)
+            agg_weight.append(agg_weight_i)
+            agg_idx.append(agg_idx_i)
+            agg_cluster.append(agg_cluster_i)
+        return agg_res, agg_weight, agg_idx, agg_cluster
 
 
-class HierarchicalPooling(nn.Module):
+class WeightModel(nn.Module):
+    def __init__(self, input_dim: int, attn_hidden: int = 64, legacy_attn: bool = False):
+        super().__init__()
+        self.agg = AggCluster(input_dim, attn_hidden, legacy_attn=legacy_attn)
+        self.fc_att = (
+            AttentionPoolingLegacy(input_dim)
+            if legacy_attn
+            else AttentionPooling(input_dim, attn_hidden)
+        )
+        self.fc_out = nn.Identity()
+
+    @staticmethod
+    def ls_to_tensor(agg_res, agg_weight, agg_idx, agg_cluster):
+        bsz = len(agg_res)
+        n_clusters = max(x.shape[0] for x in agg_res)
+        feat_dim = agg_res[0].shape[1]
+        max_cells = max(w.shape[1] for w in agg_weight)
+
+        agg_res_ts = torch.full(
+            (bsz, n_clusters, feat_dim),
+            fill_value=0.0,
+            device=agg_res[0].device,
+            dtype=agg_res[0].dtype,
+        )
+        agg_weight_ts = torch.full(
+            (bsz, n_clusters, max_cells),
+            fill_value=0.0,
+            device=agg_weight[0].device,
+            dtype=agg_weight[0].dtype,
+        )
+        agg_idx_ts = torch.full(
+            (bsz, n_clusters, max_cells),
+            fill_value=-1,
+            device=agg_idx[0].device,
+            dtype=agg_idx[0].dtype,
+        )
+        agg_cluster_ts = torch.full(
+            (bsz, n_clusters, max_cells),
+            fill_value=-1,
+            device=agg_idx[0].device,
+            dtype=agg_idx[0].dtype,
+        )
+        agg_mask_ts = torch.full(
+            (bsz, n_clusters),
+            fill_value=0,
+            device=agg_idx[0].device,
+            dtype=agg_idx[0].dtype,
+        )
+
+        for i in range(bsz):
+            nn, mm = agg_weight[i].shape
+            agg_res_ts[i, :nn] = agg_res[i]
+            agg_weight_ts[i, :nn, :mm] = agg_weight[i]
+            agg_idx_ts[i, :nn, :mm] = agg_idx[i]
+            agg_cluster_ts[i, :nn, :mm] = agg_cluster[i]
+            agg_mask_ts[i, :nn] = torch.where((agg_idx[i] == -1).all(dim=1), -1, 0)
+
+        return agg_res_ts, agg_weight_ts, agg_idx_ts, agg_cluster_ts, agg_mask_ts
+
+    @staticmethod
+    def process_weights_to_n_cell(sample_weight, agg_weight, agg_idx, agg_cluster):
+        all_cell_weight = []
+        all_cluster_weight = []
+        all_cell_idx = []
+        for b in range(sample_weight.shape[0]):
+            batch_agg_weight = agg_weight[b]
+            batch_agg_idx = agg_idx[b]
+            batch_cluster = agg_cluster[b]
+            batch_sample_weight = sample_weight[b]
+
+            valid_mask = batch_agg_idx != -1
+            valid_agg_weight = batch_agg_weight[valid_mask]
+            valid_agg_idx = batch_agg_idx[valid_mask]
+            valid_batch_cluster = batch_cluster[valid_mask]
+
+            cell_cluster_weights = torch.gather(batch_sample_weight, 0, valid_batch_cluster)
+            all_cell_weight.append(valid_agg_weight)
+            all_cluster_weight.append(cell_cluster_weights)
+            all_cell_idx.append(valid_agg_idx)
+
+        cell_weight = torch.cat(all_cell_weight, dim=0)
+        cluster_weight = torch.cat(all_cluster_weight, dim=0)
+        idx = torch.cat(all_cell_idx, dim=0)
+        return cell_weight, cluster_weight, idx
+
+    def forward(self, expr, idx, mask, cluster):
+        agg_expr, agg_weight, agg_idx, agg_cluster = self.agg(expr, idx, mask, cluster)
+        agg_expr, agg_weight, agg_idx, agg_cluster, agg_mask = self.ls_to_tensor(
+            agg_expr, agg_weight, agg_idx, agg_cluster
+        )
+        _, sample_weight = self.fc_att(agg_expr, agg_mask)
+        agg_weight, sample_weight, valid_idx = self.process_weights_to_n_cell(
+            sample_weight, agg_weight, agg_idx, agg_cluster
+        )
+        return sample_weight, agg_weight, valid_idx
+
+
+class LegacyHierarchicalPooling(nn.Module):
     def __init__(
         self,
         input_dim: int,
         attn_hidden: int = 64,
         dropout: float = 0.2,
-        cluster_pool: str = "attn",
-        use_gated_attn: bool = False,
-        mean_attn_alpha: float = 1.0,
+        legacy_attn: bool = True,
     ):
         super().__init__()
-        self.cluster = ClusterAggregator(
-            input_dim,
-            attn_hidden,
-            pool_mode=cluster_pool,
-            use_gated_attn=use_gated_attn,
-            mean_attn_alpha=mean_attn_alpha,
+        self.agg = AggCluster(input_dim, attn_hidden, legacy_attn=legacy_attn)
+        self.fc_att = (
+            AttentionPoolingLegacy(input_dim)
+            if legacy_attn
+            else AttentionPooling(input_dim, attn_hidden)
         )
-        self.sample_pool = AttentionPooling(input_dim, attn_hidden, gated=use_gated_attn)
-        self.head = nn.Sequential(
+        self.fc_out = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.BatchNorm1d(128),
             nn.LeakyReLU(),
@@ -132,96 +252,57 @@ class HierarchicalPooling(nn.Module):
         )
 
     @staticmethod
-    def _pad_clusters(cluster_embs, cell_weights, cell_ids):
-        batch_size = len(cluster_embs)
-        max_clusters = max(x.shape[0] for x in cluster_embs)
-        feat_dim = cluster_embs[0].shape[1]
-        max_cells = max(w.shape[1] for w in cell_weights)
-
-        emb_tensor = cluster_embs[0].new_zeros((batch_size, max_clusters, feat_dim))
-        weight_tensor = cell_weights[0].new_zeros((batch_size, max_clusters, max_cells))
-        id_tensor = cell_ids[0].new_full((batch_size, max_clusters, max_cells), -1)
-        cluster_mask = torch.zeros((batch_size, max_clusters), dtype=torch.bool, device=emb_tensor.device)
-
-        for i in range(batch_size):
-            n = cluster_embs[i].shape[0]
-            m = cell_weights[i].shape[1]
-            emb_tensor[i, :n] = cluster_embs[i]
-            weight_tensor[i, :n, :m] = cell_weights[i]
-            id_tensor[i, :n, :m] = cell_ids[i]
-            cluster_mask[i, :n] = True
-
-        return emb_tensor, weight_tensor, id_tensor, cluster_mask
+    def ls_to_tensor(agg_res, agg_weight, agg_idx, agg_cluster):
+        return WeightModel.ls_to_tensor(agg_res, agg_weight, agg_idx, agg_cluster)
 
     @staticmethod
-    def _flatten_weights(cluster_weights, cell_weights, cell_ids):
-        all_cell_ids = []
-        all_cell_weights = []
-        all_cluster_weights = []
-        for b in range(cluster_weights.shape[0]):
-            ids = cell_ids[b]
-            mask = ids != -1
-            if not mask.any():
-                continue
-            cell_w = cell_weights[b][mask]
-            cluster_idx = mask.nonzero(as_tuple=False)[:, 0]
-            cluster_w = cluster_weights[b][cluster_idx]
-            all_cell_ids.append(ids[mask])
-            all_cell_weights.append(cell_w)
-            all_cluster_weights.append(cluster_w)
+    def process_weights_to_n_cell(sample_weight, agg_weight, agg_idx, agg_cluster):
+        return WeightModel.process_weights_to_n_cell(sample_weight, agg_weight, agg_idx, agg_cluster)
 
-        if not all_cell_ids:
-            return (
-                cell_weights.new_zeros((0,)),
-                cell_weights.new_zeros((0,)),
-                cell_ids.new_full((0,), -1),
-            )
-
-        cell_ids_flat = torch.cat(all_cell_ids, dim=0)
-        cell_weights_flat = torch.cat(all_cell_weights, dim=0)
-        cluster_weights_flat = torch.cat(all_cluster_weights, dim=0)
-        return cell_weights_flat, cluster_weights_flat, cell_ids_flat
-
-    def forward(self, expr, cell_ids, mask, cluster, return_debug: bool = False):
-        # expr: [batch, max_cells, input_dim]
-        cluster_embs = []
-        cell_weights = []
-        cluster_ids = []
-
-        for i in range(expr.shape[0]):
-            emb, weights, ids = self.cluster(expr[i], cell_ids[i], mask[i], cluster[i])
-            cluster_embs.append(emb)
-            cell_weights.append(weights)
-            cluster_ids.append(ids)
-
-        emb_tensor, weight_tensor, id_tensor, cluster_mask = self._pad_clusters(
-            cluster_embs, cell_weights, cluster_ids
+    def forward(self, expr, idx, mask, cluster, return_debug: bool = False):
+        agg_expr, agg_weight, agg_idx, agg_cluster = self.agg(expr, idx, mask, cluster)
+        agg_expr, agg_weight, agg_idx, agg_cluster, agg_mask = self.ls_to_tensor(
+            agg_expr, agg_weight, agg_idx, agg_cluster
         )
-        # emb_tensor: [batch, max_clusters, input_dim]
-        # weight_tensor/id_tensor: [batch, max_clusters, max_cells]
 
         if return_debug:
-            sample_emb, cluster_weights, cluster_scores = self.sample_pool(
-                emb_tensor, cluster_mask, return_scores=True
+            sample_emb, cluster_weights, cluster_scores = self.fc_att(
+                agg_expr, agg_mask, return_scores=True
             )
         else:
-            sample_emb, cluster_weights = self.sample_pool(emb_tensor, cluster_mask)
+            sample_emb, cluster_weights = self.fc_att(agg_expr, agg_mask)
             cluster_scores = None
-        # sample_emb: [batch, input_dim], cluster_weights: [batch, max_clusters]
-        pred = self.head(sample_emb)
-        # pred: [batch, 1]
 
-        cell_w, cluster_w, cell_ids_flat = self._flatten_weights(
-            cluster_weights, weight_tensor, id_tensor
+        pred = self.fc_out(sample_emb)
+        cell_w, cluster_w, cell_ids_flat = self.process_weights_to_n_cell(
+            cluster_weights, agg_weight, agg_idx, agg_cluster
         )
-        # cell_w/cluster_w/cell_ids_flat: [n_cells_total]
 
         if return_debug:
             debug = {
                 "cluster_scores": cluster_scores,
-                "cluster_mask": cluster_mask,
-                "cluster_emb": emb_tensor,
+                "cluster_mask": agg_mask != -1,
+                "cluster_emb": agg_expr,
             }
             return pred, sample_emb, cluster_weights, cell_w, cluster_w, cell_ids_flat, debug
 
         return pred, sample_emb, cluster_weights, cell_w, cluster_w, cell_ids_flat
+
+
+@dataclass
+class ModelSpec:
+    input_dim: int
+    attn_hidden: int
+    legacy_attn: bool
+
+
+def detect_model_spec(state_dict: dict, input_dim: int, attn_hidden: int | None = None) -> ModelSpec:
+    if any("attention_fc" in k for k in state_dict):
+        legacy_attn = False
+        if attn_hidden is None:
+            attn_hidden = state_dict["fc_att.attention_fc.weight"].shape[0]
+    else:
+        legacy_attn = True
+        if attn_hidden is None:
+            attn_hidden = 64
+    return ModelSpec(input_dim=input_dim, attn_hidden=attn_hidden, legacy_attn=legacy_attn)

@@ -1,4 +1,6 @@
 anndata
+leidenalg
+python-igraph
 numpy
 pandas
 scanpy

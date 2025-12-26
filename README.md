@@ -1,35 +1,63 @@
-# CellFM MIL phenotype prediction
+# CellFM + Hierarchical Pooling (.publish)
 
-This repo contains a two-stage pipeline:
-1) Fine-tune CellFM on your single-cell data and export per-cell embeddings.
-2) Train a hierarchical attention pooling model to predict sample phenotypes and recover cell weights.
+This workspace contains a two-stage pipeline:
+1) (Optional) Fine-tune CellFM and export per-cell embeddings.
+2) Train a hierarchical attention pooling model to predict sample phenotypes (default: age_z_score)
+   and recover cell/sample weights.
 
 ## Layout
-- cellfm/: CellFM fine-tuning and embedding export
-- pooling/: Hierarchical attention pooling for sample-level prediction
-- csv/: Gene mapping files required by CellFM (not included)
+- cellfm/: CellFM fine-tuning and embedding export.
+- pooling/: Hierarchical attention pooling training + weight extraction.
+- csv/: Gene mapping files required by CellFM.
+- outputs/: Example outputs.
 
 ## Quick start
+
+# 0) Install dependencies
+pip install -r requirements.txt
+
+# 1) Optional: CellFM fine-tuning
 python -m cellfm.finetune --adata data/train.h5ad --ms-ckpt path/to.ckpt --out-dir outputs/cellfm
-python -m cellfm.embed --adata data/train.h5ad --pt-ckpt outputs/cellfm/model.pt --out-adata data/with_emb.h5ad
-python -m pooling.train --adata data/with_emb.h5ad --emb-key X_cellfm --out-dir outputs/pooling
-python -m pooling.train --adata data/with_emb.h5ad --emb-key X_cellfm --save_weights --out-dir outputs/pooling
+
+# 2) Export per-cell embeddings
+python -m cellfm.embed --adata data/train.h5ad --pt-ckpt outputs/cellfm/model.pt \
+  --out-adata data/with_emb.h5ad --emb-key X_cellfm
+
+# 3) Pooling training (predicts z-score labels)
+python -m pooling.train --adata data/with_emb.h5ad --emb_key X_cellfm --out_dir outputs/pooling
+
+# 4) Weight extraction from a trained checkpoint
+python -m pooling.extract --adata data/with_emb.h5ad --emb_key X_cellfm \
+  --ckpt_path outputs/pooling/model.pt --out_dir outputs/pooling
 
 ## Data expectations
+
+CellFM input:
+- h5ad with gene names in `var_names`; mapping uses `csv/expand_gene_info.csv` and
+  `csv/updated_hgcn.tsv`.
+- obs columns: celltype (string), batch_id (int), train (0/1). Missing columns are auto-filled.
+- use `--val-frac` in `cellfm.finetune` to create a validation split.
+
+Pooling input:
+- obs has sample id column (default: donor_id; use `--sample_key` to override).
+- label column (default: age_z_score; use `--label_key` to pick).
+- embeddings in `obsm[emb_key]` (default is X; use `--emb_key` to point to X_cellfm).
+- optional integer cell id column via `--cell_id_key`; otherwise obs index is used.
+- Leiden clustering is run per sample (set `--resolution`).
+
+## Outputs
+
 CellFM:
-- h5ad with obs columns: celltype (string), batch_id (int), train (0/1/2). Missing fields are filled with defaults.
-- genes should match the CellFM gene list; put mapping files in csv/.
-Pooling:
-- h5ad with obs columns: donor_id (sample id), age_value (phenotype).
-- embeddings in obsm["X_cellfm"] or use --emb-key to point to another key.
-Pooling output:
-- labels are standardized using the training mean/std; predictions are saved back to raw scale in test_pred.csv.
-- test_pred.csv includes both raw (label/pred) and standardized (label_z/pred_z) values.
-- label_scaler.csv stores the mean/std.
-- with --save_weights, exports per-cell attention weights to CSV and h5ad:
-- train_cell_weights.csv / test_cell_weights.csv, plus train_weights.h5ad / test_weights.h5ad.
-- h5ad obs columns: pooling_cell_id, pooling_sample_id, pooling_cluster_id, pooling_cell_weight, pooling_cluster_weight, pooling_weight.
+- `outputs/cellfm/model.pt`
+
+Embedding export:
+- `.h5ad` with `obsm[emb_key]` containing per-cell embeddings.
+
+Pooling training:
+- `model.pt`, `label_scaler.csv`, `test_pred.csv`
+
+Weight extraction:
+- `weights.h5ad` with obs columns: agg_weight, sample_weight, cell_weight, sample_ids
 
 ## Notes
-- MindSpore is only needed if you load a MindSpore checkpoint with --ms-ckpt.
-- All paths are examples; adjust to your environment.
+- MindSpore is only needed when loading a MindSpore checkpoint with `--ms-ckpt`.
