@@ -1,4 +1,4 @@
-# CellFM + Hierarchical Pooling (.publish)
+# scFMIL
 
 This workspace contains a two-stage pipeline:
 1) (Optional) Fine-tune CellFM and export per-cell embeddings.
