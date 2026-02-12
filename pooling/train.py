@@ -92,6 +92,19 @@ def pearson_corrcoef(x: torch.Tensor, y: torch.Tensor) -> float:
     return float((vx * vy).sum() / denom)
 
 
+def ensure_out_dir(path_str: str) -> Path:
+    out_dir = Path(path_str).expanduser()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot create out_dir at '{out_dir}'. "
+            "Please use a writable path such as './outputs/pooling2' or "
+            "'/data/chenyz/project/Age_classcify/.publish/outputs/pooling2'."
+        ) from exc
+    return out_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--adata", required=True)
@@ -113,8 +126,7 @@ def main() -> None:
     args = parser.parse_args()
 
     set_seed(args.seed)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_out_dir(args.out_dir)
 
     adata = sc.read_h5ad(args.adata)
     expr = read_expr(adata, args.emb_key)
